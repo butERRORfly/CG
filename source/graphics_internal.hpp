@@ -8,36 +8,37 @@
 
 struct GLFWwindow;
 
-namespace graphics::internal {
+namespace graphics::internal
+{
+    struct Context
+    {
+        VkPhysicalDevice physical_device;
+        VkDevice device;
 
-struct Context {
-	VkPhysicalDevice physical_device;
-	VkDevice device;
+        VmaAllocator allocator;
 
-	VmaAllocator allocator;
+        VkQueue graphics_queue;
+        uint32_t graphics_queue_index;
 
-	VkQueue graphics_queue;
-	uint32_t graphics_queue_index;
+        VkFormat swapchain_format;
+        VkExtent2D swapchain_extent;
 
-	VkFormat swapchain_format;
-	VkExtent2D swapchain_extent;
+        VkRenderPass render_pass;
+    };
 
-	VkRenderPass render_pass;
-};
+    struct FrameData
+    {
+        VkFramebuffer framebuffer;
+        VkCommandBuffer command_buffer;
+    };
 
-struct FrameData {
-	VkFramebuffer framebuffer;
-	VkCommandBuffer command_buffer;
-};
+    extern Context context;
 
-extern Context context;
+    bool initialize(GLFWwindow* const window);
+    void shutdown();
 
-bool initialize(GLFWwindow* const window);
-void shutdown();
+    void resize(uint32_t width, uint32_t height);
 
-void resize(uint32_t width, uint32_t height);
-
-FrameData prepare();
-void submitAndPresent();
-
+    FrameData prepare();
+    void submitAndPresent();
 } // namespace graphics::internal
