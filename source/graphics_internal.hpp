@@ -8,36 +8,41 @@
 
 struct GLFWwindow;
 
-namespace graphics::internal {
+namespace graphics::internal
+{
+    struct Context
+    {
+        // PhysicalDevice описывает выбранный GPU, Device — созданное логическое устройство.
+        VkPhysicalDevice physical_device;
+        VkDevice device;
 
-struct Context {
-	VkPhysicalDevice physical_device;
-	VkDevice device;
+        VmaAllocator allocator; // Выделяет память для VkBuffer/VkImage.
 
-	VmaAllocator allocator;
+        VkQueue graphics_queue; // В эту очередь отправляются command buffers.
+        uint32_t graphics_queue_index;
 
-	VkQueue graphics_queue;
-	uint32_t graphics_queue_index;
+        VkFormat swapchain_format; // Формат и размер изображения окна.
+        VkExtent2D swapchain_extent;
 
-	VkFormat swapchain_format;
-	VkExtent2D swapchain_extent;
+        VkRenderPass render_pass; // Проход фигуры: цвет + depth attachment.
+    };
 
-	VkRenderPass render_pass;
-};
+    struct FrameData
+    {
+        // Конкретный framebuffer полученного swapchain image и список команд фигуры.
+        VkFramebuffer framebuffer;
+        VkCommandBuffer command_buffer;
+    };
 
-struct FrameData {
-	VkFramebuffer framebuffer;
-	VkCommandBuffer command_buffer;
-};
+    extern Context context;
 
-extern Context context;
+    bool initialize(GLFWwindow* const window);
+    void shutdown();
 
-bool initialize(GLFWwindow* const window);
-void shutdown();
+    void resize(uint32_t width, uint32_t height);
 
-void resize(uint32_t width, uint32_t height);
-
-FrameData prepare();
-void submitAndPresent();
-
+    // Ждёт завершения прошлого кадра и получает следующее изображение swapchain.
+    FrameData prepare();
+    // Отправляет команды фигуры/UI и показывает результат после semaphore.
+    void submitAndPresent();
 } // namespace graphics::internal

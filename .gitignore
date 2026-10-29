@@ -80,3 +80,7 @@ fabric.properties
 .idea/caches/build_file_checksums.ser
 
 imgui.ini
+LICENSE.md
+source/README.md
+.DS_Store
+.idea/
