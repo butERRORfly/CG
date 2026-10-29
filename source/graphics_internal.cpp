@@ -1,6 +1,7 @@
 #include "graphics_internal.hpp"
 
 #include <iostream>
+#include <cstdlib>
 #include <vector>
 
 #include <vulkan/vulkan.h>
@@ -25,10 +26,13 @@ namespace graphics::internal
 {
     namespace
     {
+        // Instance связывает приложение с Vulkan loader; surface связывает Vulkan с окном GLFW.
         VkInstance vk_instance;
+        VkDebugUtilsMessengerEXT vk_debug_messenger;
         uint32_t vk_api_version;
         VkSurfaceKHR vk_surface;
 
+        // Изображения swapchain по очереди используются для рисования и показа.
         VkSwapchainKHR vk_swapchain;
         std::vector<VkImage> vk_swapchain_images;
         std::vector<VkImageView> vk_swapchain_image_views;
@@ -38,6 +42,7 @@ namespace graphics::internal
         uint32_t vk_swapchain_resize_height;
         bool vk_swapchain_resize_require;
 
+        // Depth — отдельное GPU-изображение. Оно хранит глубину, чтобы ближние грани закрывали дальние.
         VkFormat vk_depth_buffer_format = VK_FORMAT_UNDEFINED;
         VkImage vk_image_depth_buffer;
         VmaAllocation vma_allocation_depth_buffer;
@@ -45,19 +50,23 @@ namespace graphics::internal
 
         std::vector<VkFramebuffer> vk_framebuffers;
 
+        // Semaphores связывают GPU-операции acquire/render/present; fence позволяет ждать на CPU.
         VkSemaphore vk_semaphore_image_available;
         std::vector<VkSemaphore> vk_semaphores_image_finished;
         VkFence vk_fence_frame_in_flight;
 
+        // Пул выделяет память для command buffer — списка команд GPU.
         VkCommandPool vk_command_pool;
         VkCommandBuffer vk_command_buffer;
 
+        // У ImGui собственные дескрипторы, render pass и command buffer; scene/model описаны в application.cpp.
         VkDescriptorPool vk_imgui_descriptor_pool;
         VkRenderPass vk_imgui_render_pass;
         std::vector<VkFramebuffer> vk_imgui_framebuffers;
         VkCommandPool vk_imgui_command_pool;
         VkCommandBuffer vk_imgui_command_buffer;
 
+        // Проверяем поддержку depth/stencil формата на реальном GPU, включая MoltenVK.
         VkFormat selectDepthFormat(VkPhysicalDevice physical_device)
         {
             // Prefer the original format and preserve stencil support in the fallback.
@@ -79,8 +88,10 @@ namespace graphics::internal
             return VK_FORMAT_UNDEFINED;
         }
 
+        // Подготовка Vulkan backend интерфейса: он дорисовывает UI поверх цвета фигуры.
         bool initializeImGUI()
         {
+            // ImGui использует изображения шрифта и sampler; это отдельный от сцены пул.
             const VkDescriptorPoolSize descriptor_pool_sizes[] = {
                 {
                     .type = VK_DESCRIPTOR_TYPE_SAMPLER,
@@ -107,6 +118,7 @@ namespace graphics::internal
                 return false;
             }
 
+            // LOAD сохраняет уже нарисованную фигуру; finalLayout готовит изображение к present.
             const VkAttachmentDescription render_pass_attachment = {
                 .format = context.swapchain_format,
                 .samples = VK_SAMPLE_COUNT_1_BIT,
@@ -129,6 +141,7 @@ namespace graphics::internal
                 .pColorAttachments = &render_pass_attachment_ref,
             };
 
+            // Записи цвета фигуры должны стать видимыми проходу интерфейса перед его чтением/записью.
             const VkSubpassDependency render_pass_dependency = {
                 .srcSubpass = VK_SUBPASS_EXTERNAL,
                 .dstSubpass = 0,
@@ -140,6 +153,7 @@ namespace graphics::internal
                 .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,
             };
 
+            // Render pass описывает операции с attachments, а framebuffer ниже подключает конкретные image views.
             const VkRenderPassCreateInfo render_pass = {
                 .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
                 .attachmentCount = 1,
@@ -157,6 +171,7 @@ namespace graphics::internal
                 return false;
             }
 
+            // Для каждого изображения swapchain создаётся framebuffer нужного размера.
             const uint32_t swapchain_images_count = uint32_t(vk_swapchain_images.size());
 
             vk_imgui_framebuffers.resize(swapchain_images_count);
@@ -182,6 +197,7 @@ namespace graphics::internal
                 }
             }
 
+            // RESET_COMMAND_BUFFER разрешает переписывать command buffer после завершения предыдущего кадра.
             const VkCommandPoolCreateInfo command_pool = {
                 .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                 .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -209,6 +225,7 @@ namespace graphics::internal
                 return false;
             }
 
+            // Передаём ImGui готовые Vulkan-объекты: backend не создаёт второе устройство.
             ImGui_ImplVulkan_InitInfo init = {
                 .ApiVersion = vk_api_version,
                 .Instance = vk_instance,
@@ -227,8 +244,10 @@ namespace graphics::internal
             return ImGui_ImplVulkan_Init(&init);
         }
 
+        // Записываем команды интерфейса в отдельный command buffer после команд модели.
         void drawImGUI()
         {
+            // CPU уже дождался fence, поэтому старые команды можно заменить.
             vkResetCommandBuffer(vk_imgui_command_buffer, 0);
 
             const VkCommandBufferBeginInfo command_buffer_begin = {
@@ -247,6 +266,7 @@ namespace graphics::internal
 
             vkCmdBeginRenderPass(vk_imgui_command_buffer, &render_pass_begin, VK_SUBPASS_CONTENTS_INLINE);
 
+            // Backend переводит подготовленные ImGui draw data в команды Vulkan.
             ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), vk_imgui_command_buffer);
 
             vkCmdEndRenderPass(vk_imgui_command_buffer);
@@ -254,13 +274,16 @@ namespace graphics::internal
             vkEndCommandBuffer(vk_imgui_command_buffer);
         }
 
+        // После resize пересоздаём зависящие от размера изображения и framebuffers.
         bool rebuildSwapchain(uint32_t width, uint32_t height)
         {
+            // Перед уничтожением изображений и контейнеров дожидаемся использующей их очереди.
             vkQueueWaitIdle(context.graphics_queue);
 
             vkb::SwapchainBuilder sb(context.physical_device, context.device, vk_surface,
                                      context.graphics_queue_index, context.graphics_queue_index);
 
+            // FIFO синхронизирует показ с обновлением экрана; old_swapchain помогает заменить swapchain.
             auto sb_result = sb.set_desired_extent(width, height)
                                .use_default_format_selection()
                                .set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR)
@@ -270,6 +293,7 @@ namespace graphics::internal
             if (!sb_result)
             {
                 std::cerr << sb_result.error().message() << '\n';
+                return false;
             }
 
             auto vkb_swapchain = sb_result.value();
@@ -296,6 +320,7 @@ namespace graphics::internal
             vkDestroyImageView(context.device, vk_image_view_depth_buffer, nullptr);
             vmaDestroyImage(context.allocator, vk_image_depth_buffer, vma_allocation_depth_buffer);
 
+            // Depth attachment имеет те же ширину/высоту, что и цветовое изображение.
             const VkImageCreateInfo depth_buffer = {
                 .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
                 .imageType = VK_IMAGE_TYPE_2D,
@@ -310,6 +335,7 @@ namespace graphics::internal
                 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
             };
 
+            // VMA выбирает подходящую GPU-память; CPU напрямую depth не заполняет.
             const VmaAllocationCreateInfo depth_buffer_allocation = {
                 .usage = VMA_MEMORY_USAGE_AUTO,
             };
@@ -322,6 +348,7 @@ namespace graphics::internal
                 return false;
             }
 
+            // Image view задаёт, какую часть изображения подключить как depth attachment.
             const VkImageViewCreateInfo depth_buffer_view = {
                 .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
                 .image = vk_image_depth_buffer,
@@ -343,8 +370,10 @@ namespace graphics::internal
                 return false;
             }
 
+            // Для каждого изображения swapchain создаётся framebuffer нужного размера.
             const uint32_t swapchain_images_count = uint32_t(vk_swapchain_images.size());
 
+            // В framebuffer фигуры два изображения: цвет конкретного swapchain image и общая глубина.
             VkImageView framebuffer_attachments[] = {
                 VK_NULL_HANDLE,
                 vk_image_view_depth_buffer,
@@ -376,6 +405,7 @@ namespace graphics::internal
 
             vk_imgui_framebuffers.resize(swapchain_images_count);
 
+            // Интерфейс рисуется в то же цветовое изображение, но без depth attachment.
             VkFramebufferCreateInfo imgui_framebuffer = {
                 .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
                 .renderPass = vk_imgui_render_pass,
@@ -405,18 +435,28 @@ namespace graphics::internal
 
     Context context;
 
+    // Создаём Vulkan-устройство и ресурсы вывода; параметры сцены хранит application.cpp.
     bool initialize(GLFWwindow* const window)
     {
         vkb::InstanceBuilder ib;
 
+        // vk-bootstrap создаёт instance; validation layers и debug messenger выводят ошибки API в консоль.
         auto ibr = ib.require_api_version(VK_MAKE_VERSION(1, 1, 0))
                      .request_validation_layers()
+                     .use_default_debug_messenger()
                      .build();
 
+        if (!ibr)
+        {
+            std::cerr << ibr.error().message() << '\n';
+            return false;
+        }
         auto vkb_instance = ibr.value();
         vk_instance = vkb_instance.instance;
+        vk_debug_messenger = vkb_instance.debug_messenger;
         vk_api_version = vkb_instance.api_version;
 
+        // Surface связывает системное окно GLFW с механизмом показа изображений Vulkan.
         if (glfwCreateWindowSurface(vk_instance, window, nullptr, &vk_surface) != VK_SUCCESS)
         {
             const char* message = nullptr;
@@ -425,6 +465,7 @@ namespace graphics::internal
             return false;
         }
 
+        // Выбираем физический GPU с поддержкой вывода в данное окно.
         vkb::PhysicalDeviceSelector pds(vkb_instance, vk_surface);
 
         auto pds_result = pds.prefer_gpu_device_type(vkb::PreferredDeviceType::discrete)
@@ -445,6 +486,7 @@ namespace graphics::internal
             return false;
         }
 
+        // Создаём логическое устройство и получаем графическую очередь для команд рисования.
         vkb::DeviceBuilder db(vkb_physical_device);
 
         auto db_result = db.build();
@@ -479,6 +521,7 @@ namespace graphics::internal
             return false;
         }
 
+        // VMA управляет памятью буферов/изображений на выбранном Vulkan-устройстве.
         const VmaAllocatorCreateInfo allocator = {
             .physicalDevice = context.physical_device,
             .device = context.device,
@@ -492,6 +535,7 @@ namespace graphics::internal
             return false;
         }
 
+        // Swapchain — набор цветовых изображений, которые система может показывать в окне.
         vkb::SwapchainBuilder sb(vkb_device);
 
         auto sb_result = sb.use_default_format_selection()
@@ -509,12 +553,15 @@ namespace graphics::internal
         vk_swapchain = vkb_swapchain.swapchain;
         context.swapchain_format = vkb_swapchain.image_format;
         context.swapchain_extent = vkb_swapchain.extent;
+        vk_swapchain_resize_width = context.swapchain_extent.width;
+        vk_swapchain_resize_height = context.swapchain_extent.height;
         vk_swapchain_images = vkb_swapchain.get_images().value();
         vk_swapchain_image_views = vkb_swapchain.get_image_views().value();
         vk_swapchain_current_image = UINT32_MAX;
 
         const uint32_t swapchain_images_count = uint32_t(vk_swapchain_images.size());
 
+        // Отдельное depth image используется тестом глубины; размер совпадает со swapchain.
         const VkImageCreateInfo depth_buffer = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .imageType = VK_IMAGE_TYPE_2D,
@@ -541,6 +588,7 @@ namespace graphics::internal
             return false;
         }
 
+        // Framebuffer использует image view, указывающий на depth-компоненту изображения.
         const VkImageViewCreateInfo depth_buffer_view = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             .image = vk_image_depth_buffer,
@@ -562,6 +610,7 @@ namespace graphics::internal
             return false;
         }
 
+        // Начало прохода очищает цвет и глубину; цвет сохраняется для следующего прохода ImGui.
         const VkAttachmentDescription render_pass_attachments[] = {
             {
                 .format = context.swapchain_format,
@@ -595,6 +644,7 @@ namespace graphics::internal
             .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         };
 
+        // Один graphics subpass использует цвет и depth; depthCompareOp задан в pipeline модели.
         const VkSubpassDescription render_pass_subpass = {
             .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
             .colorAttachmentCount = 1,
@@ -647,11 +697,13 @@ namespace graphics::internal
 
         const VkSemaphoreCreateInfo semaphore = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
 
+        // Изначально fence сигнальный: первому кадру не нужно ждать ещё не отправленные команды.
         const VkFenceCreateInfo fence = {
             .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
             .flags = VK_FENCE_CREATE_SIGNALED_BIT,
         };
 
+        // Сигнал окончания рисования хранится на каждое изображение для безопасного present.
         vk_semaphores_image_finished.resize(swapchain_images_count);
 
         for (uint32_t i = 0; i < swapchain_images_count; ++i)
@@ -677,6 +729,7 @@ namespace graphics::internal
             return false;
         }
 
+        // Создаём пул и один переиспользуемый командный буфер фигуры.
         const VkCommandPoolCreateInfo command_pool = {
             .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
             .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -711,6 +764,7 @@ namespace graphics::internal
         return true;
     }
 
+    // Освобождаем Vulkan-ресурсы после GPU; зависимые объекты удаляются раньше устройства/instance.
     void shutdown()
     {
         vkQueueWaitIdle(context.graphics_queue);
@@ -754,9 +808,11 @@ namespace graphics::internal
         vkDestroyDevice(context.device, nullptr);
 
         vkDestroySurfaceKHR(vk_instance, vk_surface, nullptr);
+        vkb::destroy_debug_utils_messenger(vk_instance, vk_debug_messenger);
         vkDestroyInstance(vk_instance, nullptr);
     }
 
+    // Callback GLFW только запоминает новые размеры; GPU-ресурсы меняются позже.
     void resize(uint32_t width, uint32_t height)
     {
         if (width == 0 || height == 0)
@@ -772,9 +828,12 @@ namespace graphics::internal
 
     FrameData prepare()
     {
-        vkWaitForFences(context.device, 1, &vk_fence_frame_in_flight, VK_TRUE, UINT64_MAX);
+        // Один кадр в работе: после fence CPU может безопасно менять общие UBO/SSBO.
+        if (vkWaitForFences(context.device, 1, &vk_fence_frame_in_flight, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+            return {};
 
     retry_acquire:
+        // Acquire возвращает индекс изображения; GPU-готовность будет сообщена semaphore image_available.
         switch (vkAcquireNextImageKHR(context.device, vk_swapchain, UINT64_MAX,
                                       vk_semaphore_image_available, VK_NULL_HANDLE,
                                       &vk_swapchain_current_image))
@@ -783,7 +842,8 @@ namespace graphics::internal
             break;
 
         case VK_ERROR_OUT_OF_DATE_KHR:
-            rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height);
+            if (!rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height))
+                return {};
             goto retry_acquire;
 
         case VK_SUBOPTIMAL_KHR:
@@ -795,6 +855,7 @@ namespace graphics::internal
             return {};
         }
 
+        // Новый submit снова подаст этот fence после исполнения кадра.
         vkResetFences(context.device, 1, &vk_fence_frame_in_flight);
 
         return {
@@ -803,11 +864,14 @@ namespace graphics::internal
         };
     }
 
+    // Отправляем команды фигуры и UI, затем запрашиваем показ готового изображения.
     void submitAndPresent()
     {
         drawImGUI();
 
+        // Ждём image_available на стадии записи цвета: до неё изображение swapchain трогать нельзя.
         const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        // Порядок: сначала фигура с очисткой, затем интерфейс с LOAD существующего цвета.
         const VkCommandBuffer command_buffers[] = {
             vk_command_buffer,
             vk_imgui_command_buffer,
@@ -824,8 +888,13 @@ namespace graphics::internal
             .pSignalSemaphores = &vk_semaphores_image_finished[vk_swapchain_current_image],
         };
 
-        vkQueueSubmit(context.graphics_queue, 1, &submit, vk_fence_frame_in_flight);
+        if (vkQueueSubmit(context.graphics_queue, 1, &submit, vk_fence_frame_in_flight) != VK_SUCCESS)
+        {
+            std::cerr << "Failed to submit frame\n";
+            std::abort(); // Иначе следующий кадр навсегда ждал бы несигнализированный fence.
+        }
 
+        // Present ждёт semaphore image_finished, чтобы показать завершённое изображение.
         const VkPresentInfoKHR present = {
             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
             .waitSemaphoreCount = 1,

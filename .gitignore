@@ -81,3 +81,6 @@ fabric.properties
 
 imgui.ini
 LICENSE.md
+source/README.md
+.DS_Store
+.idea/

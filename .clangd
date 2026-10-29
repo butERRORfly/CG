@@ -1,0 +1,3 @@
+# CMake генерирует здесь compile_commands.json: include-пути, defines и C++20.
+CompileFlags:
+  CompilationDatabase: build-debug
