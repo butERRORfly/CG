@@ -49,7 +49,7 @@ vec3 safeNormalize(vec3 value) {
 }
 
 vec3 blinnPhong(vec3 N, vec3 V, vec3 L, vec3 radiance) {
-    // Закон Ламберта: диффузный вклад = Kd * max(N·L, 0), N и L нормализованы.
+    // Закон Ламберта: диффузный вклад = Kd * max(N*L, 0), N и L нормализованы.
     float diffuse = max(dot(N, L), 0.0);
     if (diffuse <= 0.0)
         return vec3(0.0); // Свет за поверхностью не создаёт диффузную часть и блик.
@@ -57,7 +57,7 @@ vec3 blinnPhong(vec3 N, vec3 V, vec3 L, vec3 radiance) {
     // H — половинчатый вектор между направлением к камере и к свету.
     vec3 H = safeNormalize(V + L);
     float specular = pow(max(dot(N, H), 0.0), modelData.specularShininess.w);
-    // Блинн–Фонг: C = I * (Kd*max(N·L,0) + Ks*max(N·H,0)^alpha).
+    // Блинн–Фонг: C = I * (Kd*max(N*L,0) + Ks*max(N*H,0)^alpha).
     return radiance * (modelData.albedo.rgb * diffuse +
                        modelData.specularShininess.rgb * specular);
 }
