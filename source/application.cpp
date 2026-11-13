@@ -817,7 +817,6 @@ bool createTextureResources() {
     std::cerr << "GPU does not support linear sampling of RGBA8 sRGB textures\n";
     return false;
   }
-  // Сэмплер задаёт фильтрацию и адресацию независимо от изображения.
   const VkSamplerCreateInfo samplerInfo{
       .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
       .magFilter = VK_FILTER_LINEAR,
