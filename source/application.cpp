@@ -10,7 +10,15 @@
 #include <imgui.h>
 #include <iostream>
 #include <numbers>
+#include <string>
 #include <vector>
+
+// PNG/JPEG декодируется на CPU в плотно упакованный массив пикселей RGBA8.
+// Реализация stb_image включается ровно в одном cpp-файле.
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
 
 namespace {
 // Точка/направление в 3D. Для плоских граней нормаль вычислим через cross двух
@@ -21,10 +29,11 @@ struct Vec3 {
   float z;
 };
 
-// position и normal — два независимых атрибута вершинного шейдера.
+// UV задаёт положение вершины в двумерном пространстве текстуры.
 struct Vertex {
   Vec3 position;
   Vec3 normal;
+  float uv[2];
 };
 
 // GLSL mat4 хранит 4 столбца по 4 float; индекс элемента: column * 4 + row.
@@ -53,6 +62,18 @@ struct alignas(16) ModelUniforms {
       specularShininess[4]; // RGB блика и показатель степени m из Блинн–Фонга.
 };
 
+// Короткие параметры сэмплирования записываются в команды GPU,
+// а матрицы и материал по-прежнему хранятся в динамическом UBO.
+struct SamplingConstants {
+  std::int32_t enabled;
+  float time;
+  float strength;
+  float uvScale;
+  std::int32_t tvEnabled;
+  float tvTime;
+  float tvStrength;
+};
+
 // Точечный источник задаётся позицией, цветом и интенсивностью; массив
 // источников передаётся через SSBO с раскладкой std430.
 struct alignas(16) PointLight {
@@ -76,7 +97,18 @@ struct Buffer {
   VkDeviceSize capacity = 0;
 };
 
-static_assert(sizeof(Vertex) == 24);
+struct Texture {
+  VkImage image = VK_NULL_HANDLE;
+  VmaAllocation allocation = nullptr;
+  VkImageView view = VK_NULL_HANDLE;
+  VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+  std::string path; // Фактический файл; пустая строка означает служебную текстуру.
+};
+
+static_assert(sizeof(Vertex) == 32);
+static_assert(offsetof(Vertex, uv) == 24);
+static_assert(sizeof(SamplingConstants) == 28);
+static_assert(offsetof(SamplingConstants, tvEnabled) == 16);
 static_assert(sizeof(Mat4) == 64);
 static_assert(sizeof(SceneUniforms) == 160);
 static_assert(offsetof(SceneUniforms, lightCounts) == 144);
@@ -115,7 +147,7 @@ ProjectionMode projectionMode = ProjectionMode::Perspective;
 float objectPosition[3] = {0.0f, 0.0f, 0.0f};
 float objectRotationDegrees[3] = {20.0f, -25.0f, 0.0f};
 float objectScale[3] = {1.0f, 1.0f, 1.0f};
-float objectColor[3] = {0.9f, 0.6f, 0.2f};
+float objectColor[3] = {1.0f, 1.0f, 1.0f}; // Белый множитель сохраняет цвет текстуры.
 float specularColor[3] = {1.0f, 1.0f, 1.0f};
 float shininess = 32.0f;
 
@@ -138,6 +170,24 @@ float lightIntensity = 0.8f;
 std::vector<PointLight> pointLights;
 std::vector<SpotLight> spotLights;
 VkDeviceSize maxStorageBufferBytes = 0;
+
+constexpr std::array<const char *, 3> kTexturePaths{
+    "textures/1", "textures/2", "textures/3"};
+std::array<Texture, kTexturePaths.size()> textures{};
+int selectedTexture = 0;
+bool samplingEnabled = false;
+float samplingSpeed = 1.0f;
+float samplingStrength = 0.7f;
+float uvScale = 1.0f;
+double samplingTime = 0.0;
+bool tvNoiseEnabled = false;
+float tvNoiseSpeed = 1.0f;
+float tvNoiseStrength = 0.7f;
+double tvNoiseTime = 0.0;
+// Один буфер рассчитан на массив моделей; сейчас используется слот 0.
+constexpr std::uint32_t kMaxModels = 1024;
+constexpr std::uint32_t kModelIndex = 0;
+VkDeviceSize modelUniformStride = 0;
 
 bool animationPlaying = false;
 float animationSpeedY = 0.8f;
@@ -243,7 +293,7 @@ constexpr std::array<std::uint16_t, 60> kIndices{{
 static_assert(kIndices.size() % 3 == 0);
 
 // У соседних граней одна позиция, но разные нормали. Поэтому для GPU дублируем
-// углы треугольников: 60 записей position+normal, геометрических точек всё
+// углы треугольников: 60 записей position+normal+UV, геометрических точек всё
 // ещё 12.
 std::array<Vertex, kIndices.size()> meshVertices{};
 std::array<std::uint16_t, kIndices.size()> meshIndices{};
@@ -264,8 +314,31 @@ void generateMeshNormals() {
     normal.x /= length;
     normal.y /= length;
     normal.z /= length;
+
+    // Проецируем позицию на две взаимно перпендикулярные оси плоскости грани.
+    // Оси зависят только от нормали, поэтому внутри шестиугольника UV общие
+    // для всех четырёх треугольников, а не отдельная картинка на каждом.
+    const Vec3 reference = std::abs(normal.y) < 0.9f
+                               ? Vec3{0.0f, 1.0f, 0.0f}
+                               : Vec3{1.0f, 0.0f, 0.0f};
+    Vec3 axisU{reference.y * normal.z - reference.z * normal.y,
+               reference.z * normal.x - reference.x * normal.z,
+               reference.x * normal.y - reference.y * normal.x};
+    const float uLength = std::sqrt(axisU.x * axisU.x + axisU.y * axisU.y +
+                                     axisU.z * axisU.z);
+    axisU.x /= uLength;
+    axisU.y /= uLength;
+    axisU.z /= uLength;
+    const Vec3 axisV{normal.y * axisU.z - normal.z * axisU.y,
+                     normal.z * axisU.x - normal.x * axisU.z,
+                     normal.x * axisU.y - normal.y * axisU.x};
+    const float uvFactor = 0.5f / std::sqrt(1.0f + 2.0f * t * t);
     for (std::size_t corner = 0; corner < 3; ++corner) {
-      meshVertices[i + corner] = {kVertices[kIndices[i + corner]], normal};
+      const Vec3 p = kVertices[kIndices[i + corner]];
+      meshVertices[i + corner] = {
+          p, normal,
+          {0.5f + (p.x * axisU.x + p.y * axisU.y + p.z * axisU.z) * uvFactor,
+           0.5f - (p.x * axisV.x + p.y * axisV.y + p.z * axisV.z) * uvFactor}};
       meshIndices[i + corner] = static_cast<std::uint16_t>(i + corner);
     }
   }
@@ -287,7 +360,10 @@ Buffer pointLightBuffer;
 Buffer spotLightBuffer;
 VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
 VkDescriptorSet sceneDescriptorSet = VK_NULL_HANDLE;
-VkDescriptorSet modelDescriptorSet = VK_NULL_HANDLE;
+VkSampler textureSampler = VK_NULL_HANDLE;
+VkCommandPool uploadCommandPool = VK_NULL_HANDLE;
+VkCommandBuffer uploadCommandBuffer = VK_NULL_HANDLE;
+VkFence uploadFence = VK_NULL_HANDLE;
 
 bool loadShaderModule(const char *path, VkShaderModule &result) {
   // Читаем уже скомпилированный glslc двоичный SPIR-V, не текст GLSL.
@@ -391,17 +467,18 @@ bool createGraphicsPipeline() {
       .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
   };
 
-  // location 0 = XYZ, location 1 = нормаль; шаг между вершинами — 24 байта.
-  const VkVertexInputAttributeDescription attributes[2] = {
+  // location 2 передаёт UV; шаг между вершинами составляет 32 байта.
+  const VkVertexInputAttributeDescription attributes[3] = {
       {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, position)},
       {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)},
+      {2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, uv)},
   };
 
   const VkPipelineVertexInputStateCreateInfo vertexInput{
       .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
       .vertexBindingDescriptionCount = 1,
       .pVertexBindingDescriptions = &vertexBinding,
-      .vertexAttributeDescriptionCount = 2,
+      .vertexAttributeDescriptionCount = 3,
       .pVertexAttributeDescriptions = attributes,
   };
 
@@ -485,7 +562,7 @@ bool createGraphicsPipeline() {
   return true;
 }
 
-bool createStaticBuffer(const void *source, VkDeviceSize byteCount,
+bool createHostBuffer(const void *source, VkDeviceSize byteCount,
                         VkBufferUsageFlags usage, Buffer &buffer) {
   auto allocator = graphics::internal::context.allocator;
 
@@ -536,6 +613,282 @@ void destroyMeshBuffers() {
   destroyBuffer(vertexBuffer);
 }
 
+// Отдельный command buffer используется для первоначальной загрузки ресурсов.
+// Графическая очередь также умеет копировать; перенос между семействами не нужен.
+bool createUploadResources() {
+  auto &context = graphics::internal::context;
+  const VkCommandPoolCreateInfo poolInfo{
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
+               VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+      .queueFamilyIndex = context.graphics_queue_index,
+  };
+  if (vkCreateCommandPool(context.device, &poolInfo, nullptr,
+                          &uploadCommandPool) != VK_SUCCESS)
+    return false;
+  const VkCommandBufferAllocateInfo bufferInfo{
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = uploadCommandPool,
+      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+      .commandBufferCount = 1,
+  };
+  if (vkAllocateCommandBuffers(context.device, &bufferInfo,
+                                &uploadCommandBuffer) != VK_SUCCESS)
+    return false;
+  const VkFenceCreateInfo fenceInfo{
+      .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+  };
+  return vkCreateFence(context.device, &fenceInfo, nullptr,
+                         &uploadFence) == VK_SUCCESS;
+}
+
+bool beginUpload() {
+  if (vkResetCommandBuffer(uploadCommandBuffer, 0) != VK_SUCCESS)
+    return false;
+  const VkCommandBufferBeginInfo info{
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+  };
+  return vkBeginCommandBuffer(uploadCommandBuffer, &info) == VK_SUCCESS;
+}
+
+bool finishUpload() {
+  auto &context = graphics::internal::context;
+  if (vkEndCommandBuffer(uploadCommandBuffer) != VK_SUCCESS ||
+      vkResetFences(context.device, 1, &uploadFence) != VK_SUCCESS)
+    return false;
+  const VkSubmitInfo submitInfo{
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .commandBufferCount = 1,
+      .pCommandBuffers = &uploadCommandBuffer,
+  };
+  if (vkQueueSubmit(context.graphics_queue, 1, &submitInfo,
+                      uploadFence) != VK_SUCCESS)
+    return false;
+  // Fence синхронизирует CPU с GPU: staging нельзя удалять до конца копирования.
+  return vkWaitForFences(context.device, 1, &uploadFence, VK_TRUE,
+                           UINT64_MAX) == VK_SUCCESS;
+}
+
+// Постоянная геометрия размещается в DEVICE_LOCAL памяти.
+// CPU заполняет только staging; конечный буфер получает данные командой GPU.
+bool createDeviceBuffer(const void *source, VkDeviceSize byteCount,
+                        VkBufferUsageFlags usage, Buffer &buffer) {
+  auto &context = graphics::internal::context;
+  Buffer staging;
+  if (!createHostBuffer(source, byteCount, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         staging))
+    return false;
+  const VkBufferCreateInfo bufferInfo{
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = byteCount,
+      .usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+  };
+  const VmaAllocationCreateInfo allocationInfo{
+      .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+      .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+  };
+  bool success = vmaCreateBuffer(context.allocator, &bufferInfo, &allocationInfo,
+                                  &buffer.handle, &buffer.allocation,
+                                  nullptr) == VK_SUCCESS;
+  if (success) {
+    buffer.capacity = byteCount;
+    success = beginUpload();
+    if (success) {
+      const VkBufferCopy copy{0, 0, byteCount};
+      vkCmdCopyBuffer(uploadCommandBuffer, staging.handle, buffer.handle, 1, &copy);
+      // Копирование должно завершить запись до чтения вершин/индексов конвейером.
+      const VkBufferMemoryBarrier barrier{
+          .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+          .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+          .dstAccessMask = usage == VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+                               ? VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT
+                               : VK_ACCESS_INDEX_READ_BIT,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .buffer = buffer.handle,
+          .offset = 0,
+          .size = byteCount,
+      };
+      vkCmdPipelineBarrier(uploadCommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 0, nullptr,
+                            1, &barrier, 0, nullptr);
+      success = finishUpload();
+    }
+  }
+  destroyBuffer(staging);
+  return success;
+}
+
+bool createTexture(const unsigned char *pixels, std::uint32_t width,
+                   std::uint32_t height, Texture &texture) {
+  auto &context = graphics::internal::context;
+  // Копируем распакованные RGBA8. 
+  const VkDeviceSize byteCount = VkDeviceSize{width} * height * 4;
+  Buffer staging;
+  if (!createHostBuffer(pixels, byteCount, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         staging))
+    return false;
+  const VkImageCreateInfo imageInfo{
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = VK_FORMAT_R8G8B8A8_SRGB,
+      .extent = {width, height, 1},
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+  };
+  const VmaAllocationCreateInfo allocationInfo{
+      .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+      .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+  };
+  bool success = vmaCreateImage(context.allocator, &imageInfo, &allocationInfo,
+                                 &texture.image, &texture.allocation,
+                                 nullptr) == VK_SUCCESS;
+  if (success) {
+    success = beginUpload();
+    if (success) {
+      // Сначала готовим изображение к копированию, затем переводим в режим чтения.
+      // Layout и маски доступа описывают разные стороны одного перехода.
+      VkImageMemoryBarrier barrier{
+          .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+          .srcAccessMask = 0,
+          .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+          .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .image = texture.image,
+          .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+      };
+      vkCmdPipelineBarrier(uploadCommandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                            0, nullptr, 1, &barrier);
+      const VkBufferImageCopy copy{
+          .bufferOffset = 0,
+          .bufferRowLength = 0, // Плотная упаковка: ширина строки берётся из extent.
+          .bufferImageHeight = 0,
+          .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+          .imageOffset = {0, 0, 0},
+          .imageExtent = {width, height, 1},
+      };
+      vkCmdCopyBufferToImage(uploadCommandBuffer, staging.handle, texture.image,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+      barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      vkCmdPipelineBarrier(uploadCommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr,
+                            0, nullptr, 1, &barrier);
+      success = finishUpload();
+    }
+  }
+  destroyBuffer(staging);
+  if (!success)
+    return false;
+
+  // VkImageView открывает шейдеру цветной слой и единственный mip-уровень.
+  const VkImageViewCreateInfo viewInfo{
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = texture.image,
+      .viewType = VK_IMAGE_VIEW_TYPE_2D,
+      .format = VK_FORMAT_R8G8B8A8_SRGB,
+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+  };
+  return vkCreateImageView(context.device, &viewInfo, nullptr,
+                             &texture.view) == VK_SUCCESS;
+}
+
+bool createTextureResources() {
+  auto &context = graphics::internal::context;
+  VkFormatProperties formatProperties{};
+  vkGetPhysicalDeviceFormatProperties(context.physical_device,
+                                      VK_FORMAT_R8G8B8A8_SRGB, &formatProperties);
+  const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+      VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+  if ((formatProperties.optimalTilingFeatures & required) != required) {
+    std::cerr << "GPU does not support linear sampling of RGBA8 sRGB textures\n";
+    return false;
+  }
+  // Сэмплер задаёт фильтрацию и адресацию независимо от изображения.
+  const VkSamplerCreateInfo samplerInfo{
+      .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+      .magFilter = VK_FILTER_LINEAR,
+      .minFilter = VK_FILTER_LINEAR,
+      .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+      .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+      .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+      .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+      .minLod = 0.0f,
+      .maxLod = 0.0f,
+  };
+  if (vkCreateSampler(context.device, &samplerInfo, nullptr,
+                       &textureSampler) != VK_SUCCESS)
+    return false;
+
+  VkPhysicalDeviceProperties properties{};
+  vkGetPhysicalDeviceProperties(context.physical_device, &properties);
+  for (std::size_t i = 0; i < textures.size(); ++i) {
+    int width = 0, height = 0;
+    unsigned char *pixels = nullptr;
+    // Размер проверяем до декодирования, чтобы не загружать заведомо слишком
+    // большое для данного устройства изображение.
+    for (const char *extension : {".png", ".jpg", ".jpeg"}) {
+      const std::string path = std::string(kTexturePaths[i]) + extension;
+      if (stbi_info(path.c_str(), &width, &height, nullptr) &&
+          width > 0 && height > 0 &&
+          static_cast<std::uint32_t>(width) <= properties.limits.maxImageDimension2D &&
+          static_cast<std::uint32_t>(height) <= properties.limits.maxImageDimension2D)
+        pixels = stbi_load(path.c_str(), &width, &height, nullptr, STBI_rgb_alpha);
+      if (pixels != nullptr) {
+        textures[i].path = path;
+        break;
+      }
+    }
+    // Пока пользователь не добавил изображение, валидный белый тексель заменяет файл.
+    const unsigned char whitePixel[4] = {255, 255, 255, 255};
+    if (pixels == nullptr)
+      std::cerr << "Cannot load " << kTexturePaths[i]
+                << ".png/.jpg/.jpeg; using a white fallback "
+                   "(missing, invalid or too large image)\n";
+    const bool success = createTexture(pixels ? pixels : whitePixel,
+                                        pixels ? width : 1, pixels ? height : 1,
+                                        textures[i]);
+    stbi_image_free(pixels);
+    if (!success)
+      return false;
+  }
+  return true;
+}
+
+void destroyTextureResources() {
+  auto &context = graphics::internal::context;
+  for (Texture &texture : textures) {
+    if (texture.view != VK_NULL_HANDLE)
+      vkDestroyImageView(context.device, texture.view, nullptr);
+    if (texture.image != VK_NULL_HANDLE)
+      vmaDestroyImage(context.allocator, texture.image, texture.allocation);
+    texture = {};
+  }
+  if (textureSampler != VK_NULL_HANDLE)
+    vkDestroySampler(context.device, textureSampler, nullptr);
+  textureSampler = VK_NULL_HANDLE;
+  if (uploadFence != VK_NULL_HANDLE)
+    vkDestroyFence(context.device, uploadFence, nullptr);
+  uploadFence = VK_NULL_HANDLE;
+  if (uploadCommandPool != VK_NULL_HANDLE)
+    vkDestroyCommandPool(context.device, uploadCommandPool, nullptr);
+  uploadCommandPool = VK_NULL_HANDLE;
+  uploadCommandBuffer = VK_NULL_HANDLE;
+}
+
 void destroyUniformResources() {
   auto &context = graphics::internal::context;
 
@@ -543,7 +896,8 @@ void destroyUniformResources() {
     vkDestroyDescriptorPool(context.device, descriptorPool, nullptr);
     descriptorPool = VK_NULL_HANDLE;
     sceneDescriptorSet = VK_NULL_HANDLE;
-    modelDescriptorSet = VK_NULL_HANDLE;
+    for (Texture &texture : textures)
+      texture.descriptorSet = VK_NULL_HANDLE;
   }
 
   destroyBuffer(spotLightBuffer);
@@ -558,7 +912,9 @@ void writeBufferDescriptor(VkDescriptorSet set, std::uint32_t binding,
   const VkDescriptorBufferInfo info{
       .buffer = buffer.handle,
       .offset = 0,
-      .range = buffer.capacity,
+      // Диапазон динамического дескриптора охватывает одну структуру модели.
+      .range = type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+                   ? sizeof(ModelUniforms) : buffer.capacity,
   };
   const VkWriteDescriptorSet write{
       .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -575,33 +931,35 @@ void writeBufferDescriptor(VkDescriptorSet set, std::uint32_t binding,
 bool createUniformResources() {
   auto &context = graphics::internal::context;
   const SceneUniforms scene{};
-  const ModelUniforms model{};
   const PointLight emptyPoint{};
   const SpotLight emptySpot{};
   // Даже при нуле источников descriptor должен ссылаться на валидный буфер.
   // Пустой элемент не читается: количество активных источников равно нулю.
-  if (!createStaticBuffer(&scene, sizeof(scene),
+  if (!createHostBuffer(&scene, sizeof(scene),
                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, sceneBuffer) ||
-      !createStaticBuffer(&model, sizeof(model),
+      !createHostBuffer(nullptr, modelUniformStride * kMaxModels,
                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, modelBuffer) ||
-      !createStaticBuffer(&emptyPoint, sizeof(emptyPoint),
+      !createHostBuffer(&emptyPoint, sizeof(emptyPoint),
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                           pointLightBuffer) ||
-      !createStaticBuffer(&emptySpot, sizeof(emptySpot),
+      !createHostBuffer(&emptySpot, sizeof(emptySpot),
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                           spotLightBuffer)) {
     return false;
   }
 
-  const VkDescriptorPoolSize poolSizes[2] = {
-      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
+  constexpr std::uint32_t materialCount = kTexturePaths.size();
+  const VkDescriptorPoolSize poolSizes[4] = {
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, materialCount},
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, materialCount},
   };
 
   const VkDescriptorPoolCreateInfo poolInfo{
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-      .maxSets = 2,
-      .poolSizeCount = 2,
+      .maxSets = 1 + materialCount,
+      .poolSizeCount = 4,
       .pPoolSizes = poolSizes,
   };
 
@@ -610,30 +968,49 @@ bool createUniformResources() {
     return false;
   }
 
-  // Порядок layout совпадает с GLSL: scene = set 0, model = set 1.
-  const VkDescriptorSetLayout layouts[2] = {sceneSetLayout, modelSetLayout};
+  // Один set сцены и по одному set на материал. Все материалы ссылаются
+  // на один динамический UBO, но содержат разные пары image view + sampler.
+  std::array<VkDescriptorSetLayout, 1 + materialCount> layouts{};
+  layouts.fill(modelSetLayout);
+  layouts[0] = sceneSetLayout;
   const VkDescriptorSetAllocateInfo setInfo{
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
       .descriptorPool = descriptorPool,
-      .descriptorSetCount = 2,
-      .pSetLayouts = layouts,
+      .descriptorSetCount = static_cast<std::uint32_t>(layouts.size()),
+      .pSetLayouts = layouts.data(),
   };
 
-  VkDescriptorSet sets[2]{};
-  if (vkAllocateDescriptorSets(context.device, &setInfo, sets) != VK_SUCCESS) {
+  std::array<VkDescriptorSet, 1 + materialCount> sets{};
+  if (vkAllocateDescriptorSets(context.device, &setInfo, sets.data()) != VK_SUCCESS) {
     return false;
   }
 
   sceneDescriptorSet = sets[0];
-  modelDescriptorSet = sets[1];
   writeBufferDescriptor(sceneDescriptorSet, 0,
                         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, sceneBuffer);
   writeBufferDescriptor(sceneDescriptorSet, 1,
                         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pointLightBuffer);
   writeBufferDescriptor(sceneDescriptorSet, 2,
                         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, spotLightBuffer);
-  writeBufferDescriptor(modelDescriptorSet, 0,
-                        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, modelBuffer);
+  for (std::size_t i = 0; i < textures.size(); ++i) {
+    textures[i].descriptorSet = sets[i + 1];
+    writeBufferDescriptor(textures[i].descriptorSet, 0,
+                          VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, modelBuffer);
+    const VkDescriptorImageInfo imageInfo{
+        .sampler = textureSampler,
+        .imageView = textures[i].view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    const VkWriteDescriptorSet write{
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = textures[i].descriptorSet,
+        .dstBinding = 1,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .pImageInfo = &imageInfo,
+    };
+    vkUpdateDescriptorSets(context.device, 1, &write, 0, nullptr);
+  }
   return true;
 }
 
@@ -651,7 +1028,7 @@ bool uploadLightBuffer(Buffer &buffer, const void *data, std::size_t count,
     const VkDeviceSize capacity = std::min(
         maxStorageBufferBytes, std::max(required, buffer.capacity * 2));
     Buffer larger;
-    if (!createStaticBuffer(nullptr, capacity,
+    if (!createHostBuffer(nullptr, capacity,
                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, larger))
       return false;
     destroyBuffer(buffer);
@@ -856,9 +1233,29 @@ void drawModelControls() {
       objectScale[component] = 1.0f;
     }
   }
-  // Материал Блинн–Фонга: Kd — альбедо, Ks — цвет блика, alpha — степень
-  // блеска.
-  ImGui::ColorEdit3("Albedo (Kd)", objectColor);
+  // Альбедо берём из выбранной текстуры; белый множитель сохраняет её цвета.
+  ImGui::Combo("Texture", &selectedTexture, kTexturePaths.data(),
+                static_cast<int>(kTexturePaths.size()));
+  if (textures[selectedTexture].path.empty())
+    ImGui::TextWrapped("PNG/JPG unavailable: white fallback. Add the file and restart.");
+  else
+    ImGui::Text("File: %s", textures[selectedTexture].path.c_str());
+  ImGui::ColorEdit3("Albedo tint", objectColor);
+  ImGui::SliderFloat("UV scale", &uvScale, 0.25f, 8.0f, "%.2f",
+                     ImGuiSliderFlags_AlwaysClamp);
+  // UI меняет параметры эффекта на CPU; render передаёт их через push constants.
+  ImGui::Checkbox("Animated sampling", &samplingEnabled);
+  ImGui::SliderFloat("Sampling strength", &samplingStrength, 0.0f, 1.0f, "%.2f",
+                     ImGuiSliderFlags_AlwaysClamp);
+  ImGui::SliderFloat("Sampling speed", &samplingSpeed, 0.0f, 3.0f, "%.2f",
+                     ImGuiSliderFlags_AlwaysClamp);
+  // Помехи телевизора — отдельный слой с собственными временем и силой.
+  ImGui::Checkbox("Old TV interference", &tvNoiseEnabled);
+  ImGui::SliderFloat("TV strength", &tvNoiseStrength, 0.0f, 1.0f, "%.2f",
+                     ImGuiSliderFlags_AlwaysClamp);
+  ImGui::SliderFloat("TV speed", &tvNoiseSpeed, 0.0f, 3.0f, "%.2f",
+                     ImGuiSliderFlags_AlwaysClamp);
+  // Материал Блинн–Фонга: Ks — цвет блика, alpha — степень блеска.
   ImGui::ColorEdit3("Specular color (Ks)", specularColor);
   ImGui::SliderFloat("Shininess", &shininess, 1.0f, 256.0f, "%.1f",
                      ImGuiSliderFlags_AlwaysClamp);
@@ -978,6 +1375,9 @@ bool initialize() {
   VkPhysicalDeviceProperties properties{};
   vkGetPhysicalDeviceProperties(context.physical_device, &properties);
   maxStorageBufferBytes = properties.limits.maxStorageBufferRange;
+  // std140 задаёт раскладку полей, лимит GPU — выравнивание начала слота модели.
+  const VkDeviceSize alignment = properties.limits.minUniformBufferOffsetAlignment;
+  modelUniformStride = (sizeof(ModelUniforms) + alignment - 1) / alignment * alignment;
 
   if (!loadShaderModule("shaders/tetra.vert.spv", vertexShader) ||
       !loadShaderModule("shaders/tetra.frag.spv", fragmentShader)) {
@@ -1008,14 +1408,17 @@ bool initialize() {
     return false;
   }
 
-  // set 1: UBO модели читается обоими шейдерами (матрицы и материал).
-  const VkDescriptorSetLayoutBinding modelBinding{
-      0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
-      VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+  // set 1 связывает текстуру материала и выбранный слот общего буфера моделей.
+  const VkDescriptorSetLayoutBinding modelBindings[2] = {
+      {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
+       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+      {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+       VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+  };
   const VkDescriptorSetLayoutCreateInfo modelLayoutInfo{
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .bindingCount = 1,
-      .pBindings = &modelBinding,
+      .bindingCount = 2,
+      .pBindings = modelBindings,
   };
   if (vkCreateDescriptorSetLayout(context.device, &modelLayoutInfo, nullptr,
                                   &modelSetLayout) != VK_SUCCESS) {
@@ -1023,10 +1426,17 @@ bool initialize() {
     return false;
   }
   const VkDescriptorSetLayout layouts[2] = {sceneSetLayout, modelSetLayout};
+  const VkPushConstantRange samplingRange{
+      .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+      .offset = 0,
+      .size = sizeof(SamplingConstants),
+  };
   const VkPipelineLayoutCreateInfo pipelineLayoutInfo{
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
       .setLayoutCount = 2,
       .pSetLayouts = layouts,
+      .pushConstantRangeCount = 1,
+      .pPushConstantRanges = &samplingRange,
   };
 
   if (vkCreatePipelineLayout(context.device, &pipelineLayoutInfo, nullptr,
@@ -1042,21 +1452,14 @@ bool initialize() {
   }
 
   generateMeshNormals();
-  if (!createStaticBuffer(meshVertices.data(), sizeof(meshVertices),
+  if (!createUploadResources() ||
+      !createDeviceBuffer(meshVertices.data(), sizeof(meshVertices),
                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertexBuffer) ||
-      !createStaticBuffer(meshIndices.data(), sizeof(meshIndices),
-                          VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indexBuffer)) {
-    std::cerr << "Cannot create mesh buffers\n";
-    destroyMeshBuffers();
-    destroyPipelineSetup();
-    return false;
-  }
-
-  if (!createUniformResources()) {
-    std::cerr << "Cannot create uniform resources\n";
-    destroyUniformResources();
-    destroyMeshBuffers();
-    destroyPipelineSetup();
+      !createDeviceBuffer(meshIndices.data(), sizeof(meshIndices),
+                          VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indexBuffer) ||
+      !createTextureResources() || !createUniformResources()) {
+    std::cerr << "Cannot upload geometry, textures or create descriptors\n";
+    shutdown();
     return false;
   }
 
@@ -1068,6 +1471,7 @@ void shutdown() {
   auto &context = graphics::internal::context;
   vkQueueWaitIdle(context.graphics_queue);
   destroyUniformResources();
+  destroyTextureResources();
   destroyMeshBuffers();
   destroyPipelineSetup();
 }
@@ -1075,14 +1479,23 @@ void shutdown() {
 void update(double time) {
   // Угол += скорость * delta time: одинаковая скорость при разной частоте
   // кадров.
-  if (previousUpdateTime >= 0.0 && animationPlaying) {
+  if (previousUpdateTime >= 0.0) {
     const double elapsed = time - previousUpdateTime;
     if (elapsed > 0.0) {
       constexpr double fullTurn = 2.0 * std::numbers::pi_v<double>;
-      animationPhaseY =
-          std::fmod(animationPhaseY + animationSpeedY * elapsed, fullTurn);
-      animationPhaseX =
-          std::fmod(animationPhaseX + animationSpeedX * elapsed, fullTurn);
+      if (animationPlaying) {
+        animationPhaseY =
+            std::fmod(animationPhaseY + animationSpeedY * elapsed, fullTurn);
+        animationPhaseX =
+            std::fmod(animationPhaseX + animationSpeedX * elapsed, fullTurn);
+      }
+      // Эффект текстуры имеет своё время и не зависит от паузы вращения модели.
+      if (samplingEnabled)
+        samplingTime = std::fmod(samplingTime + samplingSpeed * elapsed, fullTurn);
+      // Ограничиваем время для точности float; шум и скачки строк специально
+      // дискретны. Отдельные часы позволяют независимо заморозить каждый эффект.
+      if (tvNoiseEnabled)
+        tvNoiseTime = std::fmod(tvNoiseTime + tvNoiseSpeed * elapsed, 5120.0);
     }
   }
   // Обновляем даже во время паузы, чтобы Play не давал скачок накопленного
@@ -1091,7 +1504,7 @@ void update(double time) {
 
   // UI меняет только CPU-параметры. GPU-буферы обновляются позже, после fence.
   ImGui::SetNextWindowSize(ImVec2(380.0f, 660.0f), ImGuiCond_FirstUseEver);
-  ImGui::Begin("Lab 2 - Camera and lighting");
+  ImGui::Begin("Lab 3 - Texture mapping");
   ImGui::Text("12 geometric vertices, 60 GPU vertices, 20 triangles");
   drawCameraControls();
   drawModelControls();
@@ -1139,6 +1552,9 @@ void render(const graphics::internal::FrameData &fd) {
       .specularShininess = {specularColor[0], specularColor[1],
                             specularColor[2], shininess},
   };
+  // CPU записывает модель в слот, который будет выбран смещением при рисовании.
+  const std::uint32_t modelOffset =
+      static_cast<std::uint32_t>(kModelIndex * modelUniformStride);
 
   // prepare() дождался предыдущего GPU-кадра: теперь можно менять UBO, SSBO
   // и descriptors, включая перевыделение выросших массивов источников.
@@ -1150,7 +1566,7 @@ void render(const graphics::internal::FrameData &fd) {
                                 sceneBuffer.allocation, 0,
                                 sizeof(scene)) != VK_SUCCESS ||
       vmaCopyMemoryToAllocation(context.allocator, &model,
-                                modelBuffer.allocation, 0,
+                                modelBuffer.allocation, modelOffset,
                                 sizeof(model)) != VK_SUCCESS) {
     std::cerr << "Cannot upload scene, model or lights\n";
     std::abort();
@@ -1217,10 +1633,23 @@ void render(const graphics::internal::FrameData &fd) {
                          &vertexOffset);
   vkCmdBindIndexBuffer(commandBuffer, indexBuffer.handle, 0,
                        VK_INDEX_TYPE_UINT16);
-  // Два набора привязываются одновременно: scene в set 0, model в set 1.
-  const VkDescriptorSet sets[2] = {sceneDescriptorSet, modelDescriptorSet};
+  // Смещение модели задаётся при привязке готового набора дескрипторов.
+  // Другая текстура выбирает готовый набор материала с тем же динамическим UBO.
+  const VkDescriptorSet sets[2] = {
+      sceneDescriptorSet, textures[selectedTexture].descriptorSet};
   vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                          pipelineLayout, 0, 2, sets, 0, nullptr);
+                          pipelineLayout, 0, 2, sets, 1, &modelOffset);
+  const SamplingConstants sampling{
+      .enabled = samplingEnabled ? 1 : 0,
+      .time = static_cast<float>(samplingTime),
+      .strength = samplingStrength,
+      .uvScale = uvScale,
+      .tvEnabled = tvNoiseEnabled ? 1 : 0,
+      .tvTime = static_cast<float>(tvNoiseTime),
+      .tvStrength = tvNoiseStrength,
+  };
+  vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                      0, sizeof(sampling), &sampling);
   vkCmdDrawIndexed(commandBuffer, static_cast<std::uint32_t>(kIndices.size()),
                    1, 0, 0, 0);
 

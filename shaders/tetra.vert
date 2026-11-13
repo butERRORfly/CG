@@ -3,8 +3,10 @@
 // Нормаль N = normalize((B-A) × (C-A)) вычислена на CPU и передана атрибутом.
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
+layout(location = 2) in vec2 inUV;
 layout(location = 0) out vec3 worldPosition;
 layout(location = 1) out vec3 worldNormal;
+layout(location = 2) out vec2 textureUV;
 
 // Общие параметры камеры и освещения находятся в наборе дескрипторов set 0.
 // Порядок полей и std140 должны совпадать с C++ SceneUniforms.
@@ -18,7 +20,7 @@ layout(std140, set = 0, binding = 0) uniform SceneUniforms {
     ivec4 lightCounts;
 } scene;
 
-// Параметры конкретной модели отделены в set 1.
+// Шейдер читает одну модель; её слот в общем UBO выбирается динамическим смещением.
 layout(std140, set = 1, binding = 0) uniform ModelUniforms {
     mat4 model;
     mat4 normalMatrix;
@@ -30,6 +32,8 @@ void main() {
     // w=1 включает перенос точки: локальная позиция -> мировая.
     vec4 world = modelData.model * vec4(inPosition, 1.0);
     worldPosition = world.xyz;
+    // Растеризатор интерполирует переданные UV с учётом перспективы (smooth).
+    textureUV = inUV;
     // Для нормали нужна обратная транспонированная линейная часть model.
     // Перенос на направление не действует; mat3 берёт только верхний блок 3x3.
     worldNormal = mat3(modelData.normalMatrix) * inNormal;
